@@ -3,8 +3,9 @@ import requests
 from io import BytesIO
 import configparser
 import time
-import copy 
-import os 
+import copy
+import os
+import urllib.parse # Import for URL encoding
 
 # Debugging function
 def debug_print(message):
@@ -21,6 +22,9 @@ use_icecast = config.getboolean('dab-broadcast', 'use_icecast')
 output_image_path = config.get('dab-broadcast', 'output_image')
 artist_font_path = config.get('dab-broadcast', 'artist_font')
 title_font_path = config.get('dab-broadcast', 'title_font')
+# --- NEW: Last.fm API Key ---
+LASTFM_API_KEY = config.get('dab-broadcast', 'lastfm_api_key', fallback='') 
+# ---------------------------
 LOGO_FILE_PATH = 'logo.png' # Specified logo file
 
 # Define the target image size (REQUIRED: 320x240)
@@ -52,8 +56,8 @@ def load_logo(path, target_size=(LOGO_BLOCK_SIZE, LOGO_BLOCK_SIZE)):
         # Load logo with a default mode if it's not a standard PNG/JPEG type
         logo = Image.open(path)
         if logo.mode != "RGBA":
-             logo = logo.convert("RGBA")
-        
+            logo = logo.convert("RGBA")
+            
         logo = logo.resize(target_size, Image.LANCZOS)
         debug_print(f"Logo loaded and resized to {target_size}.")
         return logo
@@ -61,8 +65,70 @@ def load_logo(path, target_size=(LOGO_BLOCK_SIZE, LOGO_BLOCK_SIZE)):
         debug_print(f"Error loading logo: {e}")
         return None
 
+# --- NEW FUNCTION: Fetch album art URL from Last.fm ---
+def fetch_lastfm_album_art_url(artistname, songname, api_key):
+    if not artistname or not songname or not api_key:
+        debug_print("Missing artist, song, or Last.fm API key.")
+        return None
+
+    LASTFM_API_URL = "http://ws.audioscrobbler.com/2.0/"
+    
+    params = {
+        'method': 'track.getInfo',
+        'api_key': api_key,
+        'artist': artistname,
+        'track': songname,
+        'format': 'json',
+        'autocorrect': 1 # To help find the right track
+    }
+    
+    try:
+        debug_print(f"Last.fm lookup for: {artistname} - {songname}")
+        response = requests.get(LASTFM_API_URL, params=params, timeout=10)
+        
+        if response.status_code == 200:
+            data = response.json()
+            # The album art URL is nested in the response: track -> album -> image
+            # We look for the 'extralarge' size, which is usually the largest one available
+            
+            # Check for error first
+            if 'error' in data:
+                debug_print(f"Last.fm API Error: {data.get('message', 'Unknown Error')}")
+                return None
+
+            album_images = data.get("track", {}).get("album", {}).get("image", [])
+            
+            for image in album_images:
+                if image.get("size") == "extralarge":
+                    url = image.get("#text")
+                    if url:
+                        debug_print(f"Last.fm Album Art URL found: {url}")
+                        return url
+            
+            # Fallback for large size if extralarge is not found
+            for image in album_images:
+                if image.get("size") == "large":
+                    url = image.get("#text")
+                    if url:
+                        debug_print(f"Last.fm Album Art URL found (large fallback): {url}")
+                        return url
+
+            debug_print("Last.fm found song but no suitable album art URL.")
+            return None
+
+        else:
+            debug_print(f"Last.fm HTTP Error: {response.status_code}")
+            return None
+            
+    except requests.exceptions.RequestException as e:
+        debug_print(f"Last.fm Request Error: {e}")
+        return None
+# -------------------------------------------------------------------
+
+
 # Function to adjust font size based on the text length
 def adjust_font_size(text, font, max_width):
+    # This block is unchanged, kept for completeness
     image = Image.new('RGBA', (max_width, 1))
     draw = ImageDraw.Draw(image)
     current_font = copy.copy(font) 
@@ -82,12 +148,13 @@ def adjust_font_size(text, font, max_width):
             bbox = draw.textbbox((0, 0), text, font=current_font)
             width = bbox[2] - bbox[0]
         except Exception:
-             break
+            break
     
     return current_font
 
 # Function to truncate the text with ellipsis if it's too long
 def truncate_text(text, font, max_width):
+    # This block is unchanged, kept for completeness
     image = Image.new('RGBA', (max_width, 1))
     draw = ImageDraw.Draw(image)
     
@@ -103,21 +170,22 @@ def truncate_text(text, font, max_width):
 
 # Function to fetch now playing data with retries
 def fetch_now_playing_with_retries(max_retries=3, retry_delay=5):
+    global LASTFM_API_KEY # Use the global variable
     for attempt in range(max_retries):
         try:
             now_playing_url = icecast_url if use_icecast else azuracast_url
             debug_print(f"Fetching data from: {now_playing_url}, Attempt: {attempt + 1}")
             response = requests.get(now_playing_url, timeout=10)
 
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    debug_print("Data fetched successfully.")
-                except ValueError:
-                    print("Error: Received non-JSON response")
-                    return None, None, None
-            else:
+            if response.status_code != 200:
                 print(f"Error: Received response with status code {response.status_code}")
+                return None, None, None
+
+            try:
+                data = response.json()
+                debug_print("Data fetched successfully.")
+            except ValueError:
+                print("Error: Received non-JSON response")
                 return None, None, None
 
             # Parse song and artist name
@@ -131,7 +199,12 @@ def fetch_now_playing_with_retries(max_retries=3, retry_delay=5):
                     artistname, songname = map(str.strip, full_title.split("-", 1))
                 else:
                     songname = full_title
-                album_art_url = None 
+                
+                # --- MODIFIED: Last.fm lookup for Icecast Album Art ---
+                if LASTFM_API_KEY and artistname and songname:
+                    album_art_url = fetch_lastfm_album_art_url(artistname, songname, LASTFM_API_KEY)
+                # ----------------------------------------------------
+                
             else: # Azuracast
                 song_data = data.get("now_playing", {}).get("song", {})
                 songname = song_data.get("title", "").split("(")[0].strip()
@@ -140,14 +213,17 @@ def fetch_now_playing_with_retries(max_retries=3, retry_delay=5):
 
             debug_print(f"Now playing: {songname} by {artistname}")
             return songname, artistname, album_art_url
+        
         except Exception as e:
             debug_print(f"Error on attempt {attempt + 1}: {e}")
             time.sleep(retry_delay)
+            
     debug_print(f"Failed to fetch now-playing data after {max_retries} retries.")
     return None, None, None
 
 # Function to fetch album art
 def fetch_album_art(album_art_url):
+    # This block is unchanged, kept for completeness
     try:
         debug_print(f"Fetching album art from: {album_art_url}")
         art_response = requests.get(album_art_url, timeout=10)
